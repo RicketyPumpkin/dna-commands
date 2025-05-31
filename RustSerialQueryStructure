@@ -1,0 +1,319 @@
+// src/lib.rs
+use jni::objects::{JByteArray, JClass, JObject, JString};
+use jni::sys::{jboolean, jint, jlong, jsize};
+use jni::JNIEnv;
+use rusb::{Context, DeviceHandle, UsbContext, Version as RusbVersion}; // Using rusb
+use std::ffi::CString;
+use std::io::{Read, Write};
+use std::mem::ManuallyDrop;
+use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd}; // For file descriptor
+use std::ptr;
+use std::slice;
+use std::time::Duration;
+
+// --- Configuration for a typical USB Serial (CDC-ACM) device ---
+// These would ideally be discovered dynamically or configurable
+const DEFAULT_BAUD_RATE: u32 = 9600;
+const DEFAULT_TIMEOUT_MS: u64 = 1000;
+
+// --- Struct to hold the device handle and context ---
+// We'll store this as a raw pointer on the Java side (as a long)
+struct NativeSerialDevice {
+    context: ManuallyDrop<Context>, // rusb context
+    handle: ManuallyDrop<DeviceHandle<Context>>, // rusb device handle
+    // Serial port configuration
+    vid: u16,
+    pid: u16,
+    interface_number: u8,
+    read_endpoint: u8,
+    write_endpoint: u8,
+    timeout: Duration,
+}
+
+impl NativeSerialDevice {
+    // Opens a USB device using VID, PID and attempts to configure it as a serial device.
+    // Note: This is a simplified example. Real CDC-ACM setup is more involved.
+    // It would typically involve finding the correct interface and endpoints for CDC class.
+    fn open(vid: u16, pid: u16, interface_num: u8, read_ep: u8, write_ep: u8) -> Result<Self, String> {
+        let context = Context::new().map_err(|e| format!("rusb::Context::new failed: {:?}", e))?;
+        
+        let mut devices_found = 0;
+        let mut opened_device_handle: Option<DeviceHandle<Context>> = None;
+
+        // Iterate through devices to find the one matching VID/PID
+        // rusb needs to be able to enumerate. This can be an issue on Android if Java already "owns" the device.
+        // This part assumes Rust can still "see" and "open" the device once Android grants permission.
+        match context.devices() {
+            Ok(devices) => {
+                for device in devices.iter() {
+                    let device_desc = match device.device_descriptor() {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    };
+                    devices_found += 1;
+                    if device_desc.vendor_id() == vid && device_desc.product_id() == pid {
+                        match device.open() {
+                            Ok(mut handle) => {
+                                // Detach kernel driver if active on the interface (important on Linux-based systems)
+                                if handle.kernel_driver_active(interface_num).unwrap_or(false) {
+                                    handle.detach_kernel_driver(interface_num).map_err(|e| format!("detach_kernel_driver failed: {:?}", e))?;
+                                }
+                                handle.claim_interface(interface_num).map_err(|e| format!("claim_interface failed: {:?}", e))?;
+                                
+                                // Basic CDC-ACM setup (simplified)
+                                // Set line coding (baud rate, etc.) - 0x22 is SET_LINE_CODING
+                                // Data: baudrate (4 bytes, little-endian), stop bits (1 byte), parity (1 byte), data bits (1 byte)
+                                let mut cdc_data = [0u8; 7];
+                                cdc_data[0..4].copy_from_slice(&DEFAULT_BAUD_RATE.to_le_bytes());
+                                cdc_data[4] = 0; // 1 stop bit
+                                cdc_data[5] = 0; // No parity
+                                cdc_data[6] = 8; // 8 data bits
+                                
+                                match handle.write_control(
+                                    0x21, // Request Type: Class, Interface, Host-to-Device
+                                    0x20, // SET_LINE_CODING
+                                    0,    // Value
+                                    interface_num as u16, // Index (interface number)
+                                    &cdc_data,
+                                    Duration::from_millis(DEFAULT_TIMEOUT_MS)
+                                ) {
+                                    Ok(_) => {},
+                                    Err(e) => return Err(format!("SET_LINE_CODING failed: {:?}", e)),
+                                }
+
+                                opened_device_handle = Some(handle);
+                                break;
+                            }
+                            Err(e) => return Err(format!("Device open failed: {:?}, VID: {:04x}, PID: {:04x}", e, vid, pid)),
+                        }
+                    }
+                }
+            }
+            Err(e) => return Err(format!("rusb context.devices() failed: {:?}", e)),
+        }
+
+        if opened_device_handle.is_none() {
+            return Err(format!("Device not found or failed to open. VID: {:04x}, PID: {:04x}. Devices checked: {}", vid, pid, devices_found));
+        }
+        
+        Ok(NativeSerialDevice {
+            context: ManuallyDrop::new(context),
+            handle: ManuallyDrop::new(opened_device_handle.unwrap()),
+            vid,
+            pid,
+            interface_number: interface_num,
+            read_endpoint: read_ep, // e.g., 0x81 for Bulk IN
+            write_endpoint: write_ep, // e.g., 0x02 for Bulk OUT
+            timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
+        })
+    }
+
+    fn read(&mut self, buffer: &mut [u8]) -> Result<usize, String> {
+        match self.handle.read_bulk(self.read_endpoint, buffer, self.timeout) {
+            Ok(bytes_read) => Ok(bytes_read),
+            Err(rusb::Error::Timeout) => Ok(0), // Timeout is not necessarily an error, could mean no data
+            Err(e) => Err(format!("read_bulk failed: {:?}", e)),
+        }
+    }
+
+    fn write(&mut self, data: &[u8]) -> Result<usize, String> {
+        match self.handle.write_bulk(self.write_endpoint, data, self.timeout) {
+            Ok(bytes_written) => Ok(bytes_written),
+            Err(e) => Err(format!("write_bulk failed: {:?}", e)),
+        }
+    }
+
+    fn close(mut self) {
+        // Release interface, re-attach kernel driver (if it was detached), then drop handle and context.
+        // The drop order is important: DeviceHandle first, then Context.
+        // ManuallyDrop ensures we control this.
+        unsafe {
+            let _ = (*self.handle).release_interface(self.interface_number);
+            // Re-attaching kernel driver can be OS-specific and might not always be necessary or successful.
+            // let _ = (*self.handle).attach_kernel_driver(self.interface_number); 
+            ManuallyDrop::drop(&mut self.handle);
+            ManuallyDrop::drop(&mut self.context);
+        }
+        // Self is consumed, its fields are dropped.
+    }
+}
+
+// Helper to convert Rust String errors to JNI exceptions
+fn throw_runtime_exception(env: &mut JNIEnv, message: &str) {
+    let _ = env.throw_new("java/lang/RuntimeException", message);
+}
+
+
+// --- JNI Functions ---
+
+/// Initializes the USB serial device.
+/// Takes VID, PID, interface number, read endpoint, and write endpoint.
+/// Returns a 'long' which is a pointer to the NativeSerialDevice struct.
+/// Returns 0 on failure.
+#[no_mangle]
+pub extern "system" fn Java_com_example_usbrustotg_NativeSerial_nativeOpenDevice(
+    mut env: JNIEnv,
+    _class: JClass, // Represents the class that declared this native method
+    vid: jint,
+    pid: jint,
+    interface_num: jint,
+    read_ep: jint,
+    write_ep: jint,
+) -> jlong { // Returns a pointer to NativeSerialDevice cast to jlong
+    // It's crucial that the Java side has already obtained permission for this device
+    // via Android's UsbManager. This Rust code then tries to "re-open" it using rusb.
+    // This can be tricky if Android's UsbDeviceConnection holds an exclusive lock.
+    // An alternative is for Java to pass the file descriptor from UsbDeviceConnection.getFileDescriptor(),
+    // and Rust uses that FD with lower-level USB operations (not standard rusb).
+    // For this example, we assume rusb can find and open the device by VID/PID after Java gets permission.
+
+    match NativeSerialDevice::open(vid as u16, pid as u16, interface_num as u8, read_ep as u8, write_ep as u8) {
+        Ok(device) => {
+            // Box the device and return the raw pointer as a long
+            // The Java side will be responsible for calling nativeCloseDevice with this pointer
+            Box::into_raw(Box::new(device)) as jlong
+        }
+        Err(e) => {
+            throw_runtime_exception(&mut env, &format!("nativeOpenDevice failed: {}", e));
+            0 // Return 0 (null pointer equivalent) on failure
+        }
+    }
+}
+
+/// Reads data from the serial device.
+/// Takes the device pointer (as jlong) and a max buffer size.
+/// Returns a jbyteArray with the data read, or null on error/no data.
+#[no_mangle]
+pub extern "system" fn Java_com_example_usbrustotg_NativeSerial_nativeReadData(
+    mut env: JNIEnv,
+    _class: JClass,
+    device_ptr: jlong,
+    buffer_size: jint,
+) -> JByteArray {
+    if device_ptr == 0 {
+        throw_runtime_exception(&mut env, "nativeReadData: Invalid device handle (null)");
+        return JObject::null().into();
+    }
+    let device = unsafe { &mut *(device_ptr as *mut NativeSerialDevice) };
+
+    let mut buffer = vec![0u8; buffer_size as usize];
+    match device.read(&mut buffer) {
+        Ok(bytes_read) => {
+            if bytes_read > 0 {
+                match env.new_byte_array(bytes_read as jsize) {
+                    Ok(j_byte_array) => {
+                        // It's important to handle potential errors from set_byte_array_region
+                        if let Err(e) = env.set_byte_array_region(&j_byte_array, 0, &buffer[0..bytes_read]) {
+                             throw_runtime_exception(&mut env, &format!("nativeReadData: Failed to set byte array region: {:?}", e));
+                             return JObject::null().into();
+                        }
+                        j_byte_array
+                    }
+                    Err(e) => {
+                        throw_runtime_exception(&mut env, &format!("nativeReadData: Failed to create JByteArray: {:?}", e));
+                        JObject::null().into()
+                    }
+                }
+            } else {
+                // No data read or timeout, return empty or null array based on preference
+                env.new_byte_array(0).unwrap_or_else(|e| {
+                    throw_runtime_exception(&mut env, &format!("nativeReadData: Failed to create empty JByteArray: {:?}", e));
+                    JObject::null().into()
+                })
+            }
+        }
+        Err(e) => {
+            throw_runtime_exception(&mut env, &format!("nativeReadData failed: {}", e));
+            JObject::null().into()
+        }
+    }
+}
+
+/// Writes data to the serial device.
+/// Takes the device pointer (as jlong) and a jbyteArray containing the data.
+/// Returns the number of bytes written, or -1 on error.
+#[no_mangle]
+pub extern "system" fn Java_com_example_usbrustotg_NativeSerial_nativeWriteData(
+    mut env: JNIEnv,
+    _class: JClass,
+    device_ptr: jlong,
+    data: JByteArray,
+) -> jint {
+    if device_ptr == 0 {
+        throw_runtime_exception(&mut env, "nativeWriteData: Invalid device handle (null)");
+        return -1;
+    }
+    let device = unsafe { &mut *(device_ptr as *mut NativeSerialDevice) };
+
+    match env.convert_byte_array(data) {
+        Ok(byte_array_data) => {
+            match device.write(&byte_array_data) {
+                Ok(bytes_written) => bytes_written as jint,
+                Err(e) => {
+                    throw_runtime_exception(&mut env, &format!("nativeWriteData failed: {}", e));
+                    -1
+                }
+            }
+        }
+        Err(e) => {
+            throw_runtime_exception(&mut env, &format!("nativeWriteData: Failed to convert JByteArray: {:?}", e));
+            -1
+        }
+    }
+}
+
+/// Closes the serial device and releases resources.
+/// Takes the device pointer (as jlong).
+#[no_mangle]
+pub extern "system" fn Java_com_example_usbrustotg_NativeSerial_nativeCloseDevice(
+    mut _env: JNIEnv, // env might not be needed if not throwing exceptions
+    _class: JClass,
+    device_ptr: jlong,
+) {
+    if device_ptr == 0 {
+        // Optionally log or handle this, but usually means device wasn't opened or already closed.
+        // throw_runtime_exception(&mut _env, "nativeCloseDevice: Invalid device handle (null)");
+        return;
+    }
+    // Re-Box the raw pointer and let it drop, which calls NativeSerialDevice::drop
+    let device_to_close = unsafe { Box::from_raw(device_ptr as *mut NativeSerialDevice) };
+    device_to_close.close(); // Explicitly call our close method
+    // `device_to_close` goes out of scope here and its memory is freed.
+}
+
+/// Gets the rusb library version.
+#[no_mangle]
+pub extern "system" fn Java_com_example_usbrustotg_NativeSerial_nativeGetRusbVersion(
+    env: JNIEnv,
+    _class: JClass,
+) -> JString {
+    let version = RusbVersion::LibusbVersion {
+        major: rusb::version().major(),
+        minor: rusb::version().minor(),
+        micro: rusb::version().micro(),
+        nano: rusb::version().nano(),
+        rc: rusb::version().rc().map(|s| s.to_string()),
+        describe: rusb::version().describe().to_string(),
+    };
+
+    let version_str = format!(
+        "Libusb v{}.{}.{}.{} (rc: {:?}, describe: {})",
+        version.major(),
+        version.minor(),
+        version.micro(),
+        version.nano(),
+        version.rc(),
+        version.describe()
+    );
+
+    env.new_string(version_str)
+        .unwrap_or_else(|_| env.new_string("Error creating JNI string for rusb version").unwrap())
+}
+
+// --- Cargo.toml dependencies ---
+// [dependencies]
+// jni = "0.21.1"
+// rusb = "0.9.3" # Or latest compatible version
+//
+// [lib]
+// crate-type = ["cdylib"] # Compile as a dynamic system library
